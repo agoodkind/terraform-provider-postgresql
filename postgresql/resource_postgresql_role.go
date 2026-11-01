@@ -47,7 +47,7 @@ func resourcePostgreSQLRole() *schema.Resource {
 	return &schema.Resource{
 		Create: PGResourceFunc(resourcePostgreSQLRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLRoleRead),
-		Update: PGResourceFunc(resourcePostgreSQLRoleUpdate),
+		Update: resourcePostgreSQLRoleUpdateWithPartialState,
 		Delete: PGResourceFunc(resourcePostgreSQLRoleDelete),
 		Exists: PGResourceExistsFunc(resourcePostgreSQLRoleExists),
 		Importer: &schema.ResourceImporter{
@@ -668,7 +668,21 @@ func readRolePassword(db *DBConnection, d *schema.ResourceData, roleCanLogin boo
 	return rolePassword, nil
 }
 
+func resourcePostgreSQLRoleUpdateWithPartialState(d *schema.ResourceData, meta any) error {
+	d.Partial(true)
+
+	return PGResourceFunc(resourcePostgreSQLRoleUpdate)(d, meta)
+}
+
 func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) error {
+	priorID := d.Id()
+	committed := false
+	defer func() {
+		if !committed {
+			d.SetId(priorID)
+		}
+	}()
+
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
@@ -752,6 +766,9 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
+
+	committed = true
+	d.Partial(false)
 
 	return resourcePostgreSQLRoleReadImpl(db, d)
 }
