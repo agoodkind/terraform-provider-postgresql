@@ -1,11 +1,14 @@
 package postgresql
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -452,6 +455,211 @@ resource "postgresql_role" "role_with_search_path" {
   search_path = ["bar", "foo-with-hyphen"]
 }
 `
+
+const (
+	testAccRotationAddress       = "postgresql_role.rotation"
+	testAccInvalidValidUntil     = "not-a-timestamp"
+	testAccPasswordRejection     = "password authentication failed"
+	testAccSyntheticPasswordSize = 16
+)
+
+var (
+	testAccValidUntilFailure = regexp.MustCompile(`error updating role VALID UNTIL`)
+	testAccPlannedRotation   = regexp.MustCompile(`password_wo_version\s+=\s+"1" -> "2"`)
+)
+
+func testAccSyntheticPassword(t *testing.T) string {
+	t.Helper()
+
+	randomBytes := make([]byte, testAccSyntheticPasswordSize)
+	if _, err := rand.Read(randomBytes); err != nil {
+		t.Fatalf("could not generate a synthetic password: %v", err)
+	}
+
+	return "tfpg-synthetic-" + hex.EncodeToString(randomBytes)
+}
+
+func testAccRoleRotationConfig(roleName, password, version, validUntil string) string {
+	validUntilLine := ""
+	if validUntil != "" {
+		validUntilLine = fmt.Sprintf("  valid_until         = %q\n", validUntil)
+	}
+
+	return fmt.Sprintf(`
+resource "postgresql_role" "rotation" {
+  name                = %q
+  login               = true
+  password_wo         = %q
+  password_wo_version = %q
+%s}
+`, roleName, password, version, validUntilLine)
+}
+
+func testAccCheckRoleCannotLogin(t *testing.T, role, password string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		err := testAccCheckRoleCanLogin(t, role, password)(s)
+		if err == nil {
+			return fmt.Errorf("role %s authenticated with a password that must be rejected", role)
+		}
+
+		if !strings.Contains(err.Error(), testAccPasswordRejection) {
+			return fmt.Errorf("role %s failed with an unexpected error instead of a password rejection: %v", role, err)
+		}
+
+		return nil
+	}
+}
+
+func testAccCheckPostgresqlRoleAbsent(roleName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+
+		exists, err := checkRoleExists(client, roleName)
+		if err != nil {
+			return fmt.Errorf("error checking role %s", err)
+		}
+
+		if exists {
+			return fmt.Errorf("role %s exists but must not", roleName)
+		}
+
+		return nil
+	}
+}
+
+func testAccCheckStateOmitsSecrets(secrets ...string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		for address, resourceState := range s.RootModule().Resources {
+			for attribute, value := range resourceState.Primary.Attributes {
+				for _, secret := range secrets {
+					if strings.Contains(value, secret) {
+						return fmt.Errorf("attribute %s of %s contains a generated password", attribute, address)
+					}
+				}
+			}
+		}
+
+		return nil
+	}
+}
+
+func TestAccPostgresqlRole_UpdateFailurePreservesState(t *testing.T) {
+	const roleName = "rotation_failure_role"
+
+	originalPassword := testAccSyntheticPassword(t)
+	proposedPassword := testAccSyntheticPassword(t)
+
+	configV1 := testAccRoleRotationConfig(roleName, originalPassword, "1", "")
+	configFailing := testAccRoleRotationConfig(roleName, proposedPassword, "2", testAccInvalidValidUntil)
+	configRecovered := testAccRoleRotationConfig(roleName, proposedPassword, "2", "")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: configV1,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "password_wo_version", "1"),
+					testAccCheckRoleCanLogin(t, roleName, originalPassword),
+				),
+			},
+			{
+				Config:      configFailing,
+				ExpectError: testAccValidUntilFailure,
+			},
+			{
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "password_wo_version", "1"),
+					testAccCheckRoleCanLogin(t, roleName, originalPassword),
+					testAccCheckRoleCannotLogin(t, roleName, proposedPassword),
+					testAccCheckStateOmitsSecrets(originalPassword, proposedPassword),
+				),
+			},
+			{
+				Config:      configFailing,
+				PlanOnly:    true,
+				ExpectError: testAccPlannedRotation,
+			},
+			{
+				Config: configRecovered,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "password_wo_version", "2"),
+					testAccCheckRoleCanLogin(t, roleName, proposedPassword),
+					testAccCheckRoleCannotLogin(t, roleName, originalPassword),
+					testAccCheckStateOmitsSecrets(originalPassword, proposedPassword),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlRole_RenameRollbackPreservesID(t *testing.T) {
+	const (
+		oldName = "rotation_rename_old"
+		newName = "rotation_rename_new"
+	)
+
+	originalPassword := testAccSyntheticPassword(t)
+	proposedPassword := testAccSyntheticPassword(t)
+
+	configOld := testAccRoleRotationConfig(oldName, originalPassword, "1", "")
+	configFailing := testAccRoleRotationConfig(newName, proposedPassword, "2", testAccInvalidValidUntil)
+	configRecovered := testAccRoleRotationConfig(newName, proposedPassword, "2", "")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: configOld,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "id", oldName),
+					testAccCheckRoleCanLogin(t, oldName, originalPassword),
+				),
+			},
+			{
+				Config:      configFailing,
+				ExpectError: testAccValidUntilFailure,
+			},
+			{
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "id", oldName),
+					resource.TestCheckResourceAttr(testAccRotationAddress, "name", oldName),
+					resource.TestCheckResourceAttr(testAccRotationAddress, "password_wo_version", "1"),
+					testAccCheckPostgresqlRoleExists(oldName, nil, nil),
+					testAccCheckPostgresqlRoleAbsent(newName),
+					testAccCheckRoleCanLogin(t, oldName, originalPassword),
+					testAccCheckStateOmitsSecrets(originalPassword, proposedPassword),
+				),
+			},
+			{
+				Config: configRecovered,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(testAccRotationAddress, "id", newName),
+					resource.TestCheckResourceAttr(testAccRotationAddress, "name", newName),
+					resource.TestCheckResourceAttr(testAccRotationAddress, "password_wo_version", "2"),
+					testAccCheckPostgresqlRoleExists(newName, nil, nil),
+					testAccCheckPostgresqlRoleAbsent(oldName),
+					testAccCheckRoleCanLogin(t, newName, proposedPassword),
+					testAccCheckStateOmitsSecrets(originalPassword, proposedPassword),
+				),
+			},
+		},
+	})
+}
 
 func TestAccPostgresqlRole_WriteOnlyPassword_Basic(t *testing.T) {
 	resource.Test(t, resource.TestCase{
